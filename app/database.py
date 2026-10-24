@@ -5,7 +5,7 @@ DATABASE_URL = "sqlite:///./ordershield.db"
 
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False},  # needed for SQLite + FastAPI
+    connect_args={"check_same_thread": False, "timeout": 30},  # needed for SQLite + FastAPI
 )
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)

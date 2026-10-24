@@ -1,41 +1,47 @@
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Header, Response
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Order, OrderStatus, Product
+from app.exceptions import OrderNotFound
+from app.models import Order
 from app.schemas import OrderCreate, OrderOut
+from app.services import order_service
+from app.services.payment_service import PaymentService, get_payment_service
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
 
 @router.post("", response_model=OrderOut, status_code=201)
-def create_order(payload: OrderCreate, db: Session = Depends(get_db)):
-    product = db.get(Product, payload.product_id)
-    if not product:
-        raise HTTPException(status_code=404, detail="Product not found")
-
-    if product.stock < payload.quantity:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Insufficient stock. Available: {product.stock}",
-        )
-
-    product.stock -= payload.quantity
-    order = Order(
-        product_id=product.id,
+def create_order(
+    payload: OrderCreate,
+    response: Response,
+    idempotency_key: Annotated[str, Header(min_length=1, max_length=100)],
+    db: Session = Depends(get_db),
+    payment: PaymentService = Depends(get_payment_service),
+):
+    order, created = order_service.reserve_order(
+        db,
+        product_id=payload.product_id,
         quantity=payload.quantity,
-        total_price=product.price * payload.quantity,
-        status=OrderStatus.STOCK_RESERVED,
+        idempotency_key=idempotency_key,
     )
-    db.add(order)
-    db.commit()
-    db.refresh(order)
+    if created:
+        order = order_service.process_payment(db, order, payment)
+    else:
+        response.status_code = 200  # replay of an earlier request
     return order
 
 
 @router.get("/{order_id}", response_model=OrderOut)
 def get_order(order_id: int, db: Session = Depends(get_db)):
     order = db.get(Order, order_id)
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+    if order is None:
+        raise OrderNotFound()
     return order
+
+
+@router.post("/{order_id}/cancel", response_model=OrderOut)
+def cancel_order(order_id: int, db: Session = Depends(get_db)):
+    return order_service.cancel_order(db, order_id)
