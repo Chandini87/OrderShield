@@ -1,5 +1,5 @@
 import uuid
-
+import logging
 
 def make_product(client, stock=5, price=100):
     return client.post(
@@ -37,6 +37,7 @@ def test_insufficient_stock_creates_no_order(client):
 
     assert res.status_code == 400
     assert res.json()["detail"] == "Insufficient stock. Available: 1"
+    assert res.json()["code"] == "INSUFFICIENT_STOCK"
     assert stock_of(client, product["id"]) == 1
     assert client.get("/orders/1").status_code == 404
 
@@ -117,3 +118,13 @@ def test_cannot_cancel_payment_failed_order(client, payment):
     res = client.post(f"/orders/{order['id']}/cancel")
 
     assert res.status_code == 409
+
+def test_order_lifecycle_is_logged(client, caplog):
+    caplog.set_level(logging.INFO, logger="ordershield")
+    product = make_product(client)
+
+    place_order(client, product["id"], quantity=2)
+
+    events = [record.getMessage() for record in caplog.records]
+    assert "stock_reserved" in events
+    assert "order_confirmed" in events

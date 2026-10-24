@@ -1,3 +1,5 @@
+import logging
+
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -8,9 +10,12 @@ from app.exceptions import (
     OrderNotFound,
     ProductNotFound,
 )
+from app.logging_config import log_event
 from app.models import Order, OrderStatus, Product
 from app.services.payment_service import PaymentService
 from app.services.transitions import ensure_can_transition, transition
+
+logger = logging.getLogger("ordershield.orders")
 
 
 def _find_by_key(db: Session, key: str) -> Order | None:
@@ -39,18 +44,19 @@ def reserve_order(
     Returns (order, created). created=False means this idempotency key
     was already used, so the existing order is returned unchanged.
     """
-    # 1. Duplicate request? Return the original order.
     existing = _find_by_key(db, idempotency_key)
     if existing:
         _check_same_request(existing, product_id, quantity)
+        log_event(
+            logger, "duplicate_request_ignored",
+            order_id=existing.id, idempotency_key=idempotency_key,
+        )
         return existing, False
 
     product = db.get(Product, product_id)
     if product is None:
         raise ProductNotFound()
 
-    # 2. Insert the order. The UNIQUE constraint on idempotency_key catches
-    #    two identical requests that arrive at the same instant.
     order = Order(
         idempotency_key=idempotency_key,
         product_id=product_id,
@@ -67,10 +73,12 @@ def reserve_order(
         if existing is None:
             raise
         _check_same_request(existing, product_id, quantity)
+        log_event(
+            logger, "duplicate_request_ignored",
+            order_id=existing.id, idempotency_key=idempotency_key,
+        )
         return existing, False
 
-    # 3. Reserve stock in ONE statement: "subtract only if enough is left".
-    #    The check and the update cannot be separated by another request.
     result = db.execute(
         update(Product)
         .where(Product.id == product_id, Product.stock >= quantity)
@@ -78,13 +86,21 @@ def reserve_order(
         .execution_options(synchronize_session=False)
     )
     if result.rowcount == 0:
-        db.rollback()  # also removes the order inserted in step 2
-        available = db.scalar(select(Product.stock).where(Product.id == product_id))
-        raise InsufficientStock(available or 0)
+        db.rollback()
+        available = db.scalar(select(Product.stock).where(Product.id == product_id)) or 0
+        log_event(
+            logger, "insufficient_stock", level=logging.WARNING,
+            product_id=product_id, requested=quantity, available=available,
+        )
+        raise InsufficientStock(available)
 
-    # 4. Order row + stock change are saved together, or not at all.
     transition(order, OrderStatus.STOCK_RESERVED)
+    order_id = order.id
     db.commit()
+    log_event(
+        logger, "stock_reserved",
+        order_id=order_id, product_id=product_id, quantity=quantity,
+    )
     return order, True
 
 
@@ -93,19 +109,31 @@ def process_payment(db: Session, order: Order, payment: PaymentService) -> Order
     if order.status != OrderStatus.STOCK_RESERVED:
         return order
 
+    order_id, product_id = order.id, order.product_id
+    quantity, total = order.quantity, order.total_price
+
     try:
-        paid = payment.charge(order.total_price)
-    except Exception:
-        # A real system would ask the gateway what happened. We treat it as failed.
+        paid = payment.charge(total)
+    except Exception as exc:
+        log_event(
+            logger, "payment_gateway_error", level=logging.ERROR,
+            order_id=order_id, error=str(exc),
+        )
         paid = False
 
     if paid:
         transition(order, OrderStatus.CONFIRMED)
+        db.commit()
+        log_event(logger, "order_confirmed", order_id=order_id, total_price=total)
     else:
-        _release_stock(db, order.product_id, order.quantity)
+        _release_stock(db, product_id, quantity)
         transition(order, OrderStatus.PAYMENT_FAILED)
-
-    db.commit()  # status change + stock release saved together
+        db.commit()
+        log_event(logger, "payment_failed", level=logging.WARNING, order_id=order_id)
+        log_event(
+            logger, "stock_released",
+            order_id=order_id, product_id=product_id, quantity=quantity,
+        )
     return order
 
 
@@ -115,10 +143,9 @@ def cancel_order(db: Session, order_id: int) -> Order:
         raise OrderNotFound()
 
     previous = order.status
+    product_id, quantity = order.product_id, order.quantity
     ensure_can_transition(previous, OrderStatus.CANCELLED)
 
-    # Only cancel if the status is still what we just read. If two cancel
-    # requests race, exactly one wins, so stock is never released twice.
     result = db.execute(
         update(Order)
         .where(Order.id == order_id, Order.status == previous)
@@ -129,8 +156,18 @@ def cancel_order(db: Session, order_id: int) -> Order:
         db.rollback()
         ensure_can_transition(db.get(Order, order_id).status, OrderStatus.CANCELLED)
 
-    if previous in (OrderStatus.STOCK_RESERVED, OrderStatus.CONFIRMED):
-        _release_stock(db, order.product_id, order.quantity)
+    released = previous in (OrderStatus.STOCK_RESERVED, OrderStatus.CONFIRMED)
+    if released:
+        _release_stock(db, product_id, quantity)
 
     db.commit()
+    log_event(
+        logger, "order_cancelled",
+        order_id=order_id, previous_status=previous.value,
+    )
+    if released:
+        log_event(
+            logger, "stock_released",
+            order_id=order_id, product_id=product_id, quantity=quantity,
+        )
     return order

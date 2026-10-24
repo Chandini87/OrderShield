@@ -6,10 +6,13 @@ from app.models import OrderStatus
 
 
 class ProductCreate(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={"example": {"name": "Mobile Phone", "price": 15000, "stock": 10}}
+    )
+
     name: str = Field(min_length=1, max_length=100)
     price: float = Field(gt=0)
     stock: int = Field(ge=0)
-
 
 class ProductOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -21,6 +24,10 @@ class ProductOut(BaseModel):
 
 
 class OrderCreate(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={"example": {"product_id": 1, "quantity": 1}}
+    )
+
     product_id: int
     quantity: int = Field(gt=0)
 

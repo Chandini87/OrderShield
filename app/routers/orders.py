@@ -13,7 +13,24 @@ from app.services.payment_service import PaymentService, get_payment_service
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
 
-@router.post("", response_model=OrderOut, status_code=201)
+@router.post(
+    "",
+    response_model=OrderOut,
+    status_code=201,
+    summary="Place an order",
+    description=(
+        "Reserves stock and processes a simulated payment. "
+        "Send a unique `Idempotency-Key` per order; retrying with the same "
+        "key returns the original order instead of creating a new one."
+    ),
+    responses={
+        200: {"description": "Key already used: the original order is returned"},
+        400: {"description": "Insufficient stock"},
+        404: {"description": "Product not found"},
+        422: {"description": "Invalid input, or key reused with a different request"},
+    },
+)
+
 def create_order(
     payload: OrderCreate,
     response: Response,
@@ -42,6 +59,16 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
     return order
 
 
-@router.post("/{order_id}/cancel", response_model=OrderOut)
+@router.post(
+    "/{order_id}/cancel",
+    response_model=OrderOut,
+    summary="Cancel an order",
+    description="Cancels a confirmed or stock-reserved order and releases its stock.",
+    responses={
+        404: {"description": "Order not found"},
+        409: {"description": "Order cannot be cancelled from its current status"},
+    },
+)
+
 def cancel_order(order_id: int, db: Session = Depends(get_db)):
     return order_service.cancel_order(db, order_id)
